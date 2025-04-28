@@ -7,11 +7,46 @@
 
 gtwr.predict <- function(formula, data, obs.tv, predictdata, pred.tv, st.bw,
                          kernel = "bisquare", adaptive = FALSE, p = 2, theta = 0, 
-                         longlat = FALSE, lamda = 0.05, t.units = "auto", ksi = 0, 
-                         st.dMat1, st.dMat2, parallel_processing = FALSE, 
-                         chunk_size = 1000, calculate_variance = TRUE) {
+                         longlat = FALSE, lamda = 0.05, 
+                         t.units = c("auto", "secs", "mins", "hours", "days", "weeks"), 
+                         ksi = 0, st.dMat1, st.dMat2, parallel_processing = FALSE, 
+                         chunk_size = 1000, calculate_variance = TRUE,
+                         parallel_cores = NULL, parallel_distance_calc = TRUE,
+                         min_chunk_size = 100, chunk_multiplier = 3) {
   
-  ## Record execution time and setup
+  ##############################################################################
+  # Setup parallel processing environment
+  ##############################################################################
+  using_parallel <- FALSE
+  cl <- NULL
+  n_cores <- 1
+  
+  if (parallel_processing && requireNamespace("parallel", quietly = TRUE)) {
+    # Determine optimal core count if not specified
+    if (is.null(parallel_cores)) {
+      n_cores <- max(1, parallel::detectCores() - 1)
+    } else {
+      n_cores <- min(parallel_cores, parallel::detectCores())
+    }
+    
+    if (n_cores > 1) {
+      using_parallel <- TRUE
+      cl <- parallel::makeCluster(n_cores)
+      # Load required packages on each worker
+      parallel::clusterEvalQ(cl, {
+        if (requireNamespace("GWmodel", quietly = TRUE)) {
+          library(GWmodel)
+        }
+      })
+      cat(sprintf("Parallel processing enabled with %d cores\n", n_cores))
+    } else {
+      cat("Parallel processing requested but only 1 core available. Using sequential processing.\n")
+    }
+  }
+  
+  ##############################################################################
+  # Record execution time and setup
+  ##############################################################################
   timings <- list()
   timings[["start"]] <- Sys.time()
   this.call <- match.call()
@@ -36,6 +71,25 @@ gtwr.predict <- function(formula, data, obs.tv, predictdata, pred.tv, st.bw,
   
   if (missing(obs.tv)) stop("Time stamps 'obs.tv' for calibration data required")
   validate_time_format(obs.tv, "obs.tv")
+
+  # Validate and standardize temporal units
+  t.units <- match.arg(t.units)
+  
+  # Handle automatic temporal unit detection based on data type
+  if(t.units == "auto" && !is.null(obs.tv)) {
+    tcl <- class(obs.tv)[1]
+    if(tcl == "yearmon") {
+      cat("Detected 'yearmon' class - using months as time units\n")
+    } else if(tcl == "yearqtr") {
+      cat("Detected 'yearqtr' class - using quarters as time units\n")
+    } else if(tcl %in% c("Date", "POSIXlt", "POSIXct")) {
+      cat("Using automatic time units with", tcl, "class timestamps\n")
+    } else if(tcl %in% c("numeric", "integer")) {
+      cat("Using direct differences for numeric timestamps\n")
+    } else {
+      warning("Unrecognized timestamp class: ", tcl, ". Results may be unpredictable.")
+    }
+  }
   
   # Validation of predictdata and pred.tv will happen in their respective sections
   
@@ -177,45 +231,122 @@ gtwr.predict <- function(formula, data, obs.tv, predictdata, pred.tv, st.bw,
   st.DM1.given <- !missing(st.dMat1)
   st.DM2.given <- !missing(st.dMat2)
   
+  # Function to determine optimal chunk size for distance calculations
+  determine_chunk_size <- function(n_rows, n_cols, available_cores) {
+    # Estimate memory required per element (bytes)
+    mem_per_element <- 8  # Double precision
+    
+    # Target max memory per chunk (default 500MB)
+    max_chunk_memory <- 500 * 1024 * 1024
+    
+    # Calculate rows per chunk based on memory constraint
+    rows_per_chunk <- max(min_chunk_size, min(n_rows, floor(max_chunk_memory / (mem_per_element * n_cols))))
+    
+    # Adjust chunk size to create optimal number of chunks for parallelization
+    optimal_chunks <- max(available_cores * chunk_multiplier, 1)
+    rows_per_chunk <- min(rows_per_chunk, ceiling(n_rows / optimal_chunks))
+    
+    return(rows_per_chunk)
+  }
+  
   # Calibration-to-prediction points distance matrix
   if (!st.DM1.given) {
     cat("Calculating spatiotemporal distances between calibration and prediction points...\n")
     
-    # Use chunking for large matrices
-    if (fd.n * pd.n > 10000) {
-      cat("Large matrices detected - using chunked calculation...\n")
+    # Parallel distance matrix calculation
+    if (using_parallel && parallel_distance_calc && fd.n * pd.n > 10000) {
+      cat(sprintf("Using parallel processing with %d cores for distance calculation\n", n_cores))
       st.dMat1 <- matrix(0, fd.n, pd.n)
-      n_chunks <- ceiling(fd.n / chunk_size)
       
+      # Determine optimal chunk size for best performance
+      optimal_chunk_size <- determine_chunk_size(fd.n, pd.n, n_cores)
+      n_chunks <- ceiling(fd.n / optimal_chunk_size)
+      
+      cat(sprintf("Processing in %d chunks (approx. %d rows per chunk)\n", 
+                 n_chunks, optimal_chunk_size))
+      
+      # Create chunk indices
+      chunk_indices <- list()
       for (i in 1:n_chunks) {
-        start_idx <- (i - 1) * chunk_size + 1
-        end_idx <- min(i * chunk_size, fd.n)
-        chunk_indices <- start_idx:end_idx
-        
-        cat(sprintf("  Processing chunk %d of %d (rows %d to %d)...\n", 
-                   i, n_chunks, start_idx, end_idx))
-        
-        st.dMat1[chunk_indices, ] <- st.dist(
-          dp.locat = fd.locat[chunk_indices, , drop = FALSE],
+        start_idx <- (i - 1) * optimal_chunk_size + 1
+        end_idx <- min(i * optimal_chunk_size, fd.n)
+        chunk_indices[[i]] <- start_idx:end_idx
+      }
+      
+      # Export required data to cluster
+      parallel::clusterExport(cl, c("fd.locat", "pd.locat", "obs.tv", "pred.tv", 
+                                   "p", "theta", "longlat", "lamda", "t.units", "ksi",
+                                   "st.dist"), 
+                             envir = environment())
+      
+      # Process chunks in parallel
+      cat("Starting parallel distance matrix calculation...\n")
+      pb <- txtProgressBar(min = 0, max = n_chunks, style = 3)
+      
+      chunk_results <- parallel::parLapply(cl, 1:n_chunks, function(chunk_idx) {
+        indices <- chunk_indices[[chunk_idx]]
+        chunk_result <- st.dist(
+          dp.locat = fd.locat[indices, , drop = FALSE],
           rp.locat = pd.locat,
-          obs.tv = obs.tv[chunk_indices],
+          obs.tv = obs.tv[indices],
           reg.tv = pred.tv,
           p = p, theta = theta, longlat = longlat,
           lamda = lamda, t.units = t.units, ksi = ksi
         )
-        
-        # Force garbage collection
-        gc()
+        return(list(indices = indices, result = chunk_result))
+      })
+      
+      # Combine results
+      for(i in 1:length(chunk_results)) {
+        indices <- chunk_results[[i]]$indices
+        st.dMat1[indices, ] <- chunk_results[[i]]$result
+        setTxtProgressBar(pb, i)
       }
+      close(pb)
+      cat("\n")
+      
     } else {
-      st.dMat1 <- st.dist(
-        dp.locat = fd.locat,
-        rp.locat = pd.locat,
-        obs.tv = obs.tv,
-        reg.tv = pred.tv,
-        p = p, theta = theta, longlat = longlat,
-        lamda = lamda, t.units = t.units, ksi = ksi
-      )
+      # Original sequential chunking implementation
+      if (fd.n * pd.n > 10000) {
+        cat("Large matrices detected - using chunked calculation...\n")
+        st.dMat1 <- matrix(0, fd.n, pd.n)
+        optimal_chunk_size <- determine_chunk_size(fd.n, pd.n, 1)
+        n_chunks <- ceiling(fd.n / optimal_chunk_size)
+        
+        cat(sprintf("Processing in %d chunks (approx. %d rows per chunk)\n", 
+                   n_chunks, optimal_chunk_size))
+                   
+        pb <- txtProgressBar(min = 0, max = n_chunks, style = 3)
+        
+        for (i in 1:n_chunks) {
+          start_idx <- (i - 1) * optimal_chunk_size + 1
+          end_idx <- min(i * optimal_chunk_size, fd.n)
+          chunk_indices <- start_idx:end_idx
+          
+          st.dMat1[chunk_indices, ] <- st.dist(
+            dp.locat = fd.locat[chunk_indices, , drop = FALSE],
+            rp.locat = pd.locat,
+            obs.tv = obs.tv[chunk_indices],
+            reg.tv = pred.tv,
+            p = p, theta = theta, longlat = longlat,
+            lamda = lamda, t.units = t.units, ksi = ksi
+          )
+          
+          setTxtProgressBar(pb, i)
+          gc()
+        }
+        close(pb)
+        cat("\n")
+      } else {
+        st.dMat1 <- st.dist(
+          dp.locat = fd.locat,
+          rp.locat = pd.locat,
+          obs.tv = obs.tv,
+          reg.tv = pred.tv,
+          p = p, theta = theta, longlat = longlat,
+          lamda = lamda, t.units = t.units, ksi = ksi
+        )
+      }
     }
     
     st.DM1.given <- TRUE
@@ -231,41 +362,100 @@ gtwr.predict <- function(formula, data, obs.tv, predictdata, pred.tv, st.bw,
   if (calculate_variance && !st.DM2.given) {
     cat("Calculating spatiotemporal distances between calibration points (for variance)...\n")
     
-    # Use chunking for large matrices
-    if (fd.n * fd.n > 10000) {
-      cat("Large matrix detected - using chunked calculation...\n")
+    # Parallel distance matrix calculation
+    if (using_parallel && parallel_distance_calc && fd.n * fd.n > 10000) {
+      cat(sprintf("Using parallel processing with %d cores for calibration distance matrix\n", n_cores))
       st.dMat2 <- matrix(0, fd.n, fd.n)
-      n_chunks <- ceiling(fd.n / chunk_size)
       
+      # Determine optimal chunk size for best performance
+      optimal_chunk_size <- determine_chunk_size(fd.n, fd.n, n_cores)
+      n_chunks <- ceiling(fd.n / optimal_chunk_size)
+      
+      cat(sprintf("Processing in %d chunks (approx. %d rows per chunk)\n", 
+                 n_chunks, optimal_chunk_size))
+      
+      # Create chunk indices
+      chunk_indices <- list()
       for (i in 1:n_chunks) {
-        start_idx <- (i - 1) * chunk_size + 1
-        end_idx <- min(i * chunk_size, fd.n)
-        chunk_indices <- start_idx:end_idx
-        
-        cat(sprintf("  Processing chunk %d of %d (rows %d to %d)...\n", 
-                   i, n_chunks, start_idx, end_idx))
-        
-        st.dMat2[chunk_indices, ] <- st.dist(
-          dp.locat = fd.locat[chunk_indices, , drop = FALSE],
+        start_idx <- (i - 1) * optimal_chunk_size + 1
+        end_idx <- min(i * optimal_chunk_size, fd.n)
+        chunk_indices[[i]] <- start_idx:end_idx
+      }
+      
+      # Export required data to cluster
+      parallel::clusterExport(cl, c("fd.locat", "obs.tv", 
+                                   "p", "theta", "longlat", "lamda", "t.units", "ksi",
+                                   "st.dist"), 
+                             envir = environment())
+      
+      # Process chunks in parallel
+      cat("Starting parallel calibration distance matrix calculation...\n")
+      pb <- txtProgressBar(min = 0, max = n_chunks, style = 3)
+      
+      chunk_results <- parallel::parLapply(cl, 1:n_chunks, function(chunk_idx) {
+        indices <- chunk_indices[[chunk_idx]]
+        chunk_result <- st.dist(
+          dp.locat = fd.locat[indices, , drop = FALSE],
           rp.locat = fd.locat,
-          obs.tv = obs.tv[chunk_indices],
+          obs.tv = obs.tv[indices],
           reg.tv = obs.tv,
           p = p, theta = theta, longlat = longlat,
           lamda = lamda, t.units = t.units, ksi = ksi
         )
-        
-        # Force garbage collection
-        gc()
+        return(list(indices = indices, result = chunk_result))
+      })
+      
+      # Combine results
+      for(i in 1:length(chunk_results)) {
+        indices <- chunk_results[[i]]$indices
+        st.dMat2[indices, ] <- chunk_results[[i]]$result
+        setTxtProgressBar(pb, i)
       }
+      close(pb)
+      cat("\n")
+      
     } else {
-      st.dMat2 <- st.dist(
-        dp.locat = fd.locat,
-        rp.locat = fd.locat,
-        obs.tv = obs.tv,
-        reg.tv = obs.tv,
-        p = p, theta = theta, longlat = longlat,
-        lamda = lamda, t.units = t.units, ksi = ksi
-      )
+      # Original sequential chunking implementation
+      if (fd.n * fd.n > 10000) {
+        cat("Large matrix detected - using chunked calculation...\n")
+        st.dMat2 <- matrix(0, fd.n, fd.n)
+        optimal_chunk_size <- determine_chunk_size(fd.n, fd.n, 1)
+        n_chunks <- ceiling(fd.n / optimal_chunk_size)
+        
+        cat(sprintf("Processing in %d chunks (approx. %d rows per chunk)\n", 
+                   n_chunks, optimal_chunk_size))
+                   
+        pb <- txtProgressBar(min = 0, max = n_chunks, style = 3)
+        
+        for (i in 1:n_chunks) {
+          start_idx <- (i - 1) * optimal_chunk_size + 1
+          end_idx <- min(i * optimal_chunk_size, fd.n)
+          chunk_indices <- start_idx:end_idx
+          
+          st.dMat2[chunk_indices, ] <- st.dist(
+            dp.locat = fd.locat[chunk_indices, , drop = FALSE],
+            rp.locat = fd.locat,
+            obs.tv = obs.tv[chunk_indices],
+            reg.tv = obs.tv,
+            p = p, theta = theta, longlat = longlat,
+            lamda = lamda, t.units = t.units, ksi = ksi
+          )
+          
+          setTxtProgressBar(pb, i)
+          gc()
+        }
+        close(pb)
+        cat("\n")
+      } else {
+        st.dMat2 <- st.dist(
+          dp.locat = fd.locat,
+          rp.locat = fd.locat,
+          obs.tv = obs.tv,
+          reg.tv = obs.tv,
+          p = p, theta = theta, longlat = longlat,
+          lamda = lamda, t.units = t.units, ksi = ksi
+        )
+      }
     }
     
     st.DM2.given <- TRUE
@@ -294,78 +484,88 @@ gtwr.predict <- function(formula, data, obs.tv, predictdata, pred.tv, st.bw,
   max_failures <- round(pd.n * 0.1)  # 10% threshold
   
   # Parallel processing implementation
-  if (parallel_processing && requireNamespace("parallel", quietly = TRUE)) {
-    cat("Using parallel processing for coefficient estimation...\n")
+  if (using_parallel) {
+    cat(sprintf("Using parallel processing with %d cores for coefficient estimation\n", n_cores))
     
-    # Determine optimal number of cores
-    n_cores <- min(parallel::detectCores() - 1, pd.n, 8)  # Cap at 8 cores for safety
-    cat("  Using", n_cores, "cores\n")
+    # Create balanced chunks for optimal workload distribution
+    optimal_chunk_size <- min(1000, max(min_chunk_size, ceiling(pd.n/(n_cores * chunk_multiplier))))
+    n_chunks <- ceiling(pd.n/optimal_chunk_size)
     
-    # Create cluster and export necessary objects
-    cl <- parallel::makeCluster(n_cores)
-    parallel::clusterExport(cl, c("st.dMat1", "x", "y", "st.bw", 
-                                 "kernel", "adaptive", "pd.given"))
+    cat(sprintf("Processing in %d chunks (approx. %d points per chunk)\n", 
+               n_chunks, optimal_chunk_size))
     
-    # Load required functions in cluster
-    parallel::clusterEvalQ(cl, {
-      # Load required functions if not already in environment
-      if (!exists("gw.weight", mode = "function")) {
-        # Assumes these functions are available when sourced
-        source("path/to/gw.weight.R")  # Adjust path as needed
-      }
-      if (!exists("gw_reg_1", mode = "function")) {
-        # These functions typically come from a package
-        # If using GWmodel package, load it
-        if (requireNamespace("GWmodel", quietly = TRUE)) {
-          library(GWmodel)
+    # Create chunk indices based on range partitioning
+    chunk_indices <- list()
+    for (i in 1:n_chunks) {
+      start_idx <- (i - 1) * optimal_chunk_size + 1
+      end_idx <- min(i * optimal_chunk_size, pd.n)
+      chunk_indices[[i]] <- start_idx:end_idx
+    }
+    
+    # Export required data to cluster
+    parallel::clusterExport(cl, c("st.dMat1", "x", "y", "st.bw", "kernel", 
+                                 "adaptive", "pd.given", "fd.n", "var.n",
+                                 "gw.weight", "gw_reg_1"), 
+                           envir = environment())
+    
+    # Process chunks in parallel with load balancing
+    cat("Starting parallel coefficient estimation...\n")
+    pb <- txtProgressBar(min = 0, max = n_chunks, style = 3)
+    
+    chunk_results <- vector("list", n_chunks)
+    
+    # Execute in parallel with progress tracking
+    for (i in 1:n_chunks) {
+      chunk_results[[i]] <- parallel::parLapply(cl, chunk_indices[[i]], function(i) {
+        dist.vi <- st.dMat1[, i]
+        W.i <- gw.weight(dist.vi, st.bw, kernel, adaptive)
+        
+        # Handle self-prediction case
+        if (!pd.given) W.i[i] <- 0
+        
+        # Perform weighted regression
+        gw.resi <- try(gw_reg_1(x, y, W.i), silent = TRUE)
+        
+        if (!inherits(gw.resi, "try-error")) {
+          return(list(
+            beta = gw.resi[[1]], 
+            xtxinv = gw.resi[[2]], 
+            wt = W.i, 
+            error = FALSE
+          ))
+        } else {
+          return(list(
+            beta = rep(NA, ncol(x)), 
+            xtxinv = matrix(NA, ncol(x), ncol(x)), 
+            wt = W.i, 
+            error = TRUE,
+            error_msg = conditionMessage(attr(gw.resi, "condition"))
+          ))
         }
-      }
-    })
+      })
+      setTxtProgressBar(pb, i)
+    }
+    close(pb)
     
-    # Process each prediction point in parallel
-    cat("  Starting parallel computations...\n")
-    results <- parallel::parLapply(cl, 1:pd.n, function(i) {
-      dist.vi <- st.dMat1[, i]
-      W.i <- gw.weight(dist.vi, st.bw, kernel, adaptive)
+    # Combine results from all chunks
+    for (i in 1:n_chunks) {
+      chunk_result <- chunk_results[[i]]
+      chunk_indices_i <- chunk_indices[[i]]
       
-      # Handle self-prediction case
-      if (!pd.given) W.i[i] <- 0
-      
-      # Perform weighted regression
-      gw.resi <- try(gw_reg_1(x, y, W.i), silent = TRUE)
-      
-      if (!inherits(gw.resi, "try-error")) {
-        return(list(
-          beta = gw.resi[[1]], 
-          xtxinv = gw.resi[[2]], 
-          wt = W.i, 
-          error = FALSE
-        ))
-      } else {
-        return(list(
-          beta = rep(NA, ncol(x)), 
-          xtxinv = matrix(NA, ncol(x), ncol(x)), 
-          wt = W.i, 
-          error = TRUE,
-          error_msg = conditionMessage(attr(gw.resi, "condition"))
-        ))
-      }
-    })
-    
-    # Close cluster
-    parallel::stopCluster(cl)
-    
-    # Extract results and count errors
-    for (i in 1:pd.n) {
-      betas1[i, ] <- results[[i]]$beta
-      xtxinv[i, , ] <- results[[i]]$xtxinv
-      wt[, i] <- results[[i]]$wt
-      
-      if (results[[i]]$error) {
-        estimation_errors <- estimation_errors + 1
-        if (estimation_errors <= 5) { # Limit warning messages
-          warning(paste("Coefficient estimation failed for prediction point", i, 
-                       "- Error:", results[[i]]$error_msg))
+      for (j in 1:length(chunk_result)) {
+        point_idx <- chunk_indices_i[j]
+        result <- chunk_result[[j]]
+        
+        betas1[point_idx, ] <- result$beta
+        xtxinv[point_idx, , ] <- result$xtxinv
+        wt[, point_idx] <- result$wt
+        
+        if (result$error) {
+          estimation_errors <- estimation_errors + 1
+          if (estimation_errors <= 5) { # Limit warning messages
+            warning(paste("Coefficient estimation failed for prediction point", point_idx, 
+                         "- Error:", result$error_msg))
+          }
         }
       }
     }
@@ -373,7 +573,6 @@ gtwr.predict <- function(formula, data, obs.tv, predictdata, pred.tv, st.bw,
     if (estimation_errors > 5) {
       warning(paste("Additional", estimation_errors - 5, "estimation failures occurred"))
     }
-    
   } else {
     # Sequential processing
     cat("Using sequential processing for coefficient estimation...\n")
@@ -456,41 +655,140 @@ gtwr.predict <- function(formula, data, obs.tv, predictdata, pred.tv, st.bw,
     betas2 <- matrix(NA, nrow = fd.n, ncol = var.n)
     
     # Calculate hat matrix and coefficients at calibration points
-    estimation_ok <- TRUE
-    variance_errors <- 0
-    max_var_failures <- round(fd.n * 0.1)  # 10% threshold
-    
-    pb <- txtProgressBar(min = 0, max = fd.n, style = 3)
-    for (j in 1:fd.n) {
-      dist.vj <- st.dMat2[, j]
-      W.j <- gw.weight(dist.vj, st.bw, kernel, adaptive)
+    # Implement parallel processing for variance calculation
+    if (using_parallel) {
+      cat(sprintf("Using parallel processing with %d cores for variance calculation\n", n_cores))
       
-      # Perform weighted regression with hat matrix
-      gw.resi.calib <- try(gw_reg(x, y, W.j, TRUE, j), silent = TRUE)
+      # Create balanced chunks
+      optimal_chunk_size <- min(1000, max(min_chunk_size, ceiling(fd.n/(n_cores * chunk_multiplier))))
+      n_chunks <- ceiling(fd.n/optimal_chunk_size)
       
-      if (!inherits(gw.resi.calib, "try-error")) {
-        betas2[j, ] <- gw.resi.calib[[1]]
-        S[j, ] <- gw.resi.calib[[2]]  # Store row j of hat matrix
-      } else {
-        variance_errors <- variance_errors + 1
-        betas2[j, ] <- NA
-        S[j, ] <- NA
+      cat(sprintf("Processing in %d chunks (approx. %d points per chunk)\n", 
+                 n_chunks, optimal_chunk_size))
+      
+      # Create chunk indices
+      chunk_indices <- list()
+      for (i in 1:n_chunks) {
+        start_idx <- (i - 1) * optimal_chunk_size + 1
+        end_idx <- min(i * optimal_chunk_size, fd.n)
+        chunk_indices[[i]] <- start_idx:end_idx
+      }
+      
+      # Export required data to cluster
+      parallel::clusterExport(cl, c("st.dMat2", "x", "y", "st.bw", "kernel", 
+                                   "adaptive", "fd.n", "var.n",
+                                   "gw.weight", "gw_reg"), 
+                             envir = environment())
+      
+      # Process chunks in parallel
+      cat("Starting parallel variance estimation...\n")
+      pb <- txtProgressBar(min = 0, max = n_chunks, style = 3)
+      
+      chunk_results <- vector("list", n_chunks)
+      
+      # Execute in parallel with progress tracking
+      for (i in 1:n_chunks) {
+        chunk_results[[i]] <- parallel::parLapply(cl, chunk_indices[[i]], function(j) {
+          dist.vj <- st.dMat2[, j]
+          W.j <- gw.weight(dist.vj, st.bw, kernel, adaptive)
+          
+          # Perform weighted regression with hat matrix
+          gw.resi.calib <- try(gw_reg(x, y, W.j, TRUE, j), silent = TRUE)
+          
+          if (!inherits(gw.resi.calib, "try-error")) {
+            return(list(
+              beta = gw.resi.calib[[1]],
+              S_row = gw.resi.calib[[2]],
+              error = FALSE
+            ))
+          } else {
+            return(list(
+              beta = rep(NA, ncol(x)),
+              S_row = rep(NA, fd.n),
+              error = TRUE,
+              error_msg = conditionMessage(attr(gw.resi.calib, "condition"))
+            ))
+          }
+        })
+        setTxtProgressBar(pb, i)
+      }
+      close(pb)
+      
+      # Combine results and track errors
+      variance_errors <- 0
+      max_var_failures <- round(fd.n * 0.1)  # 10% threshold
+      
+      for (i in 1:n_chunks) {
+        chunk_result <- chunk_results[[i]]
+        chunk_indices_i <- chunk_indices[[i]]
         
-        if (variance_errors <= 3) {  # Limit warnings
-          warning(paste("Variance estimation failed for calibration point", j, 
-                       "- Error:", conditionMessage(attr(gw.resi.calib, "condition"))))
-        }
-        
-        if (variance_errors > max_var_failures) {
-          warning("Excessive failures in variance estimation. Aborting variance calculation.")
-          estimation_ok <- FALSE
-          break
+        for (j in 1:length(chunk_result)) {
+          point_idx <- chunk_indices_i[j]
+          result <- chunk_result[[j]]
+          
+          if (!result$error) {
+            betas2[point_idx, ] <- result$beta
+            S[point_idx, ] <- result$S_row
+          } else {
+            variance_errors <- variance_errors + 1
+            betas2[point_idx, ] <- NA
+            S[point_idx, ] <- NA
+            
+            if (variance_errors <= 3) {  # Limit warnings
+              warning(paste("Variance estimation failed for calibration point", point_idx, 
+                           "- Error:", result$error_msg))
+            }
+            
+            if (variance_errors > max_var_failures) {
+              warning("Excessive failures in variance estimation. Aborting variance calculation.")
+              estimation_ok <- FALSE
+              break
+            }
+          }
         }
       }
       
-      setTxtProgressBar(pb, j)
+      # Determine if estimation was successful
+      estimation_ok <- variance_errors <= max_var_failures
+      
+    } else {
+      # Sequential processing for variance calculation
+      estimation_ok <- TRUE
+      variance_errors <- 0
+      max_var_failures <- round(fd.n * 0.1)  # 10% threshold
+      
+      pb <- txtProgressBar(min = 0, max = fd.n, style = 3)
+      for (j in 1:fd.n) {
+        dist.vj <- st.dMat2[, j]
+        W.j <- gw.weight(dist.vj, st.bw, kernel, adaptive)
+        
+        # Perform weighted regression with hat matrix
+        gw.resi.calib <- try(gw_reg(x, y, W.j, TRUE, j), silent = TRUE)
+        
+        if (!inherits(gw.resi.calib, "try-error")) {
+          betas2[j, ] <- gw.resi.calib[[1]]
+          S[j, ] <- gw.resi.calib[[2]]  # Store row j of hat matrix
+        } else {
+          variance_errors <- variance_errors + 1
+          betas2[j, ] <- NA
+          S[j, ] <- NA
+          
+          if (variance_errors <= 3) {  # Limit warnings
+            warning(paste("Variance estimation failed for calibration point", j, 
+                         "- Error:", conditionMessage(attr(gw.resi.calib, "condition"))))
+          }
+          
+          if (variance_errors > max_var_failures) {
+            warning("Excessive failures in variance estimation. Aborting variance calculation.")
+            estimation_ok <- FALSE
+            break
+          }
+        }
+        
+        setTxtProgressBar(pb, j)
+      }
+      close(pb)
     }
-    close(pb)
     
     if (estimation_ok) {
       # Check for too many NA rows in hat matrix
@@ -520,12 +818,48 @@ gtwr.predict <- function(formula, data, obs.tv, predictdata, pred.tv, st.bw,
       } else {
         # Calculate Residual Sum of Squares (RSS)
         # Directly calculate residuals using estimated coefficients
+        cat("Calculating residuals for variance estimation...\n")
         yhat_calib <- numeric(fd.n)
-        for (j in 1:fd.n) {
-          if (!any(is.na(betas2[j, ]))) {
-            yhat_calib[j] <- sum(x[j, ] * betas2[j, ])
-          } else {
-            yhat_calib[j] <- NA
+        
+        # Parallel calculation of fitted values
+        if (using_parallel && fd.n > 10000) {
+          # Export data to cluster
+          parallel::clusterExport(cl, c("betas2", "x", "fd.n", "var.n"), 
+                                 envir = environment())
+          
+          # Calculate fitted values in parallel chunks
+          chunk_size_fitted <- ceiling(fd.n / n_cores)
+          fitted_chunks <- parallel::parLapply(cl, 1:n_cores, function(core_id) {
+            start_idx <- (core_id - 1) * chunk_size_fitted + 1
+            end_idx <- min(core_id * chunk_size_fitted, fd.n)
+            if (start_idx > fd.n) return(NULL)
+            
+            fitted_values <- numeric(end_idx - start_idx + 1)
+            for (j in start_idx:end_idx) {
+              if (!any(is.na(betas2[j, ]))) {
+                fitted_values[j - start_idx + 1] <- sum(x[j, ] * betas2[j, ])
+              } else {
+                fitted_values[j - start_idx + 1] <- NA
+              }
+            }
+            return(list(start_idx = start_idx, end_idx = end_idx, values = fitted_values))
+          })
+          
+          # Combine fitted values
+          for (chunk in fitted_chunks) {
+            if (!is.null(chunk)) {
+              idx_range <- (chunk$start_idx):(chunk$end_idx)
+              yhat_calib[idx_range] <- chunk$values
+            }
+          }
+        } else {
+          # Sequential calculation
+          for (j in 1:fd.n) {
+            if (!any(is.na(betas2[j, ]))) {
+              yhat_calib[j] <- sum(x[j, ] * betas2[j, ])
+            } else {
+              yhat_calib[j] <- NA
+            }
           }
         }
         
@@ -564,43 +898,131 @@ gtwr.predict <- function(formula, data, obs.tv, predictdata, pred.tv, st.bw,
             
             # Calculate variance for each prediction point
             cat("  Calculating variance for each prediction point...\n")
-            pb <- txtProgressBar(min = 0, max = pd.n, style = 3)
             
-            for (i in 1:pd.n) {
-              setTxtProgressBar(pb, i)
-              if (!valid_betas[i]) next  # Skip if coefficients were NA
+            # Use parallel processing for prediction variance if available
+            if (using_parallel && pd.n > 10000) {
+              cat(sprintf("Using parallel processing with %d cores for prediction variance\n", n_cores))
               
-              # Use stored xtxinv and weights wt[,i]
-              w2 <- wt[, i] * wt[, i]
-              w2x <- sweep(x, 1, w2, "*")  # Weight rows of x by w2
-              xtw2x <- t(x) %*% w2x
+              # Create balanced chunks
+              optimal_chunk_size <- min(1000, max(min_chunk_size, ceiling(pd.n/(n_cores * chunk_multiplier))))
+              n_chunks <- ceiling(pd.n/optimal_chunk_size)
               
-              # Extract the stored (X'W_iX)^-1 for prediction point i
-              xtxinvp <- xtxinv[i, , ]
-              if (any(is.na(xtxinvp))) next
+              cat(sprintf("Processing in %d chunks (approx. %d points per chunk)\n", 
+                         n_chunks, optimal_chunk_size))
               
-              # Calculate s0 = (X'W_iX)^-1 (X'W_i^2 X) (X'W_iX)^-1
-              s0 <- try(xtxinvp %*% xtw2x %*% xtxinvp, silent = TRUE)
-              if (inherits(s0, "try-error") || any(!is.finite(s0))) {
-                next
+              # Create chunk indices
+              chunk_indices <- list()
+              for (i in 1:n_chunks) {
+                start_idx <- (i - 1) * optimal_chunk_size + 1
+                end_idx <- min(i * optimal_chunk_size, pd.n)
+                chunk_indices[[i]] <- start_idx:end_idx
               }
               
-              # Calculate s1 = x_pred_i * s0 * x_pred_i'
-              x.pi <- matrix(x.p[i, ], nrow = 1)
-              s1 <- try(x.pi %*% s0 %*% t(x.pi), silent = TRUE)
-              if (inherits(s1, "try-error") || !is.finite(s1[1,1])) {
-                next
+              # Export necessary data to cluster
+              parallel::clusterExport(cl, c("x", "wt", "xtxinv", "x.p", "valid_betas", 
+                                           "sigma.hat", "fd.n", "var.n"), 
+                                     envir = environment())
+              
+              # Process chunks in parallel
+              pb <- txtProgressBar(min = 0, max = n_chunks, style = 3)
+              
+              # Execute in parallel with progress tracking
+              chunk_results <- vector("list", n_chunks)
+              for (i in 1:n_chunks) {
+                chunk_results[[i]] <- parallel::parLapply(cl, chunk_indices[[i]], function(i) {
+                  if (!valid_betas[i]) return(NA)  # Skip if coefficients were NA
+                  
+                  # Use stored xtxinv and weights wt[,i]
+                  w2 <- wt[, i] * wt[, i]
+                  w2x <- matrix(0, nrow = nrow(x), ncol = ncol(x))
+                  
+                  # Manually perform element-wise multiplication for w2x
+                  for (r in 1:nrow(x)) {
+                    for (c in 1:ncol(x)) {
+                      w2x[r, c] <- x[r, c] * w2[r]
+                    }
+                  }
+                  
+                  xtw2x <- t(x) %*% w2x
+                  
+                  # Extract the stored (X'W_iX)^-1 for prediction point i
+                  xtxinvp <- xtxinv[i, , ]
+                  if (any(is.na(xtxinvp))) return(NA)
+                  
+                  # Calculate s0 = (X'W_iX)^-1 (X'W_i^2 X) (X'W_iX)^-1
+                  s0 <- try(xtxinvp %*% xtw2x %*% xtxinvp, silent = TRUE)
+                  if (inherits(s0, "try-error") || any(!is.finite(s0))) {
+                    return(NA)
+                  }
+                  
+                  # Calculate s1 = x_pred_i * s0 * x_pred_i'
+                  x.pi <- matrix(x.p[i, ], nrow = 1)
+                  s1 <- try(x.pi %*% s0 %*% t(x.pi), silent = TRUE)
+                  if (inherits(s1, "try-error") || !is.finite(s1[1,1])) {
+                    return(NA)
+                  }
+                  
+                  # Prediction variance
+                  s1_value <- as.numeric(s1)
+                  pse_squared <- sigma.hat * (1 + s1_value)
+                  
+                  if (is.finite(pse_squared) && pse_squared >= 0) {
+                    return(pse_squared)
+                  } else {
+                    return(NA)
+                  }
+                })
+                setTxtProgressBar(pb, i)
+              }
+              close(pb)
+              
+              # Combine results
+              for (i in 1:n_chunks) {
+                chunk_result <- unlist(chunk_results[[i]])
+                chunk_indices_i <- chunk_indices[[i]]
+                predict.var[chunk_indices_i] <- chunk_result
               }
               
-              # Prediction variance
-              s1_value <- as.numeric(s1)
-              pse_squared <- sigma.hat * (1 + s1_value)
+            } else {
+              # Sequential calculation of prediction variance
+              pb <- txtProgressBar(min = 0, max = pd.n, style = 3)
               
-              if (is.finite(pse_squared) && pse_squared >= 0) {
-                predict.var[i] <- pse_squared
+              for (i in 1:pd.n) {
+                setTxtProgressBar(pb, i)
+                if (!valid_betas[i]) next  # Skip if coefficients were NA
+                
+                # Use stored xtxinv and weights wt[,i]
+                w2 <- wt[, i] * wt[, i]
+                w2x <- sweep(x, 1, w2, "*")  # Weight rows of x by w2
+                xtw2x <- t(x) %*% w2x
+                
+                # Extract the stored (X'W_iX)^-1 for prediction point i
+                xtxinvp <- xtxinv[i, , ]
+                if (any(is.na(xtxinvp))) next
+                
+                # Calculate s0 = (X'W_iX)^-1 (X'W_i^2 X) (X'W_iX)^-1
+                s0 <- try(xtxinvp %*% xtw2x %*% xtxinvp, silent = TRUE)
+                if (inherits(s0, "try-error") || any(!is.finite(s0))) {
+                  next
+                }
+                
+                # Calculate s1 = x_pred_i * s0 * x_pred_i'
+                x.pi <- matrix(x.p[i, ], nrow = 1)
+                s1 <- try(x.pi %*% s0 %*% t(x.pi), silent = TRUE)
+                if (inherits(s1, "try-error") || !is.finite(s1[1,1])) {
+                  next
+                }
+                
+                # Prediction variance
+                s1_value <- as.numeric(s1)
+                pse_squared <- sigma.hat * (1 + s1_value)
+                
+                if (is.finite(pse_squared) && pse_squared >= 0) {
+                  predict.var[i] <- pse_squared
+                }
               }
+              close(pb)
             }
-            close(pb)
           }
         }
       }
@@ -685,17 +1107,27 @@ gtwr.predict <- function(formula, data, obs.tv, predictdata, pred.tv, st.bw,
     result_df[["residual"]] <- original_values - gw.predict
   }
   
-  # Add timestamps for temporal reference
-  # Convert different time formats to character for consistency
+  # Add timestamps for temporal reference in numeric format
   time_column <- "time_value"
   if (inherits(pred.tv, "Date")) {
-    result_df[[time_column]] <- as.character(pred.tv)
+    # Convert Date objects to numeric days since 1970-01-01
+    result_df[[time_column]] <- as.numeric(pred.tv)
   } else if (inherits(pred.tv, "POSIXct") || inherits(pred.tv, "POSIXlt")) {
-    result_df[[time_column]] <- format(pred.tv, "%Y-%m-%d %H:%M:%S")
+    # Convert POSIXt objects to numeric seconds since epoch
+    result_df[[time_column]] <- as.numeric(pred.tv)
+  } else if (inherits(pred.tv, "yearmon")) {
+    # Convert yearmon to numeric (fractional years)
+    result_df[[time_column]] <- as.numeric(pred.tv)
+  } else if (inherits(pred.tv, "yearqtr")) {
+    # Convert yearqtr to numeric (fractional years)
+    result_df[[time_column]] <- as.numeric(pred.tv)
   } else {
-    # For numeric or other formats, convert to character
-    result_df[[time_column]] <- as.character(pred.tv)
+    # For already numeric formats, preserve as-is
+    result_df[[time_column]] <- pred.tv
   }
+
+  # Add explicit time class attribute for reference
+  attr(result_df[[time_column]], "time_class") <- class(pred.tv)[1]
   
   # Create spatial object with predictions
   if (inherits(predict.SPDF, "Spatial")) {
@@ -744,7 +1176,9 @@ gtwr.predict <- function(formula, data, obs.tv, predictdata, pred.tv, st.bw,
     ksi = ksi,
     t.units = t.units, 
     fd.n = fd.n, 
-    pd.n = pd.n
+    pd.n = pd.n,
+    parallel_processing = parallel_processing,
+    parallel_cores = n_cores
   )
   
   # Create result object with enhanced properties
@@ -766,6 +1200,11 @@ gtwr.predict <- function(formula, data, obs.tv, predictdata, pred.tv, st.bw,
   execution_time <- as.numeric(difftime(timings[["stop"]], timings[["start"]], units = "secs"))
   cat("\nPrediction completed in", round(execution_time, 2), "seconds\n")
   cat("Successfully predicted", sum(!is.na(gw.predict)), "out of", pd.n, "locations\n")
+  
+  # Clean up parallel resources
+  if (!is.null(cl)) {
+    parallel::stopCluster(cl)
+  }
   
   invisible(res)
 }
@@ -817,6 +1256,13 @@ print.gtwrm.pred <- function(x, ...) {
                                      paste0("Minkowski p=", x$GTW.arguments$p)))
   cat("\n  Temporal units:", x$GTW.arguments$t.units)
   cat("\n  ST combination: lambda =", x$GTW.arguments$lamda, ", ksi =", x$GTW.arguments$ksi)
+  
+  # Show parallel processing info if used
+  if (!is.null(x$GTW.arguments$parallel_processing) && x$GTW.arguments$parallel_processing) {
+    cat("\n  Parallel processing: Enabled with", x$GTW.arguments$parallel_cores, "cores")
+  } else {
+    cat("\n  Parallel processing: Disabled")
+  }
   
   # Display evaluation metrics if available
   if (length(x$metrics) > 0) {
